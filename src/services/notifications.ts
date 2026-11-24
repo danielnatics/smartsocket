@@ -39,10 +39,20 @@ export async function sendAppNotification(title: string, body: string, id = Math
     if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
       new Notification(title, {
         body,
-        icon: '/assets/icon.png',
+        icon: '/icons/icon-192.png',
       });
     }
   } catch (err) {
     console.warn('Notification error:', err);
   }
 }
+
+// ── Notification IDs (stable so they deduplicate) ──────────────────────────
+export const NOTIF_IDS = {
+  HIGH_TEMP:    (socketId: string) => parseInt(socketId.replace(/\D/g, '') || '1') * 100 + 1,
+  OUTAGE:       (socketId: string) => parseInt(socketId.replace(/\D/g, '') || '1') * 100 + 2,
+  RESTORED:     (socketId: string) => parseInt(socketId.replace(/\D/g, '') || '1') * 100 + 3,
+  VOLTAGE_TRIP: (socketId: string) => parseInt(socketId.replace(/\D/g, '') || '1') * 100 + 4,
+  TIMER_DONE:   (socketId: string) => parseInt(socketId.replace(/\D/g, '') || '1') * 100 + 5,
+};
+

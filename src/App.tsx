@@ -12,7 +12,7 @@ import {
   parseTelemetryNumber,
 } from './types';
 import { loadSavedSockets, saveSocketsToStorage } from './services/storage';
-import { requestNotificationPermissions, sendAppNotification } from './services/notifications';
+import { requestNotificationPermissions, sendAppNotification, NOTIF_IDS } from './services/notifications';
 
 const Paho = (PahoLib as any).default || (PahoLib as any).Paho || (window as any).Paho || PahoLib;
 
@@ -58,10 +58,19 @@ export default function App() {
   const [manualSocketName, setManualSocketName] = useState('');
   const [renameText, setRenameText] = useState('');
 
+  // Settings accordion + manual input state
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [delayInput, setDelayInput] = useState('');
+  const [timerInput, setTimerInput] = useState('');
+
   const clientRef = useRef<any>(null);
   const pendingCommandsRef = useRef<Record<string, { targetRelay: boolean; expiresAt: number }>>({});
   const lastCommandTimeRef = useRef<Record<string, number>>({});
   const temperatureAlarmStateRef = useRef<Record<string, boolean>>({});
+  // Notification state tracking refs
+  const outageStateRef = useRef<Record<string, boolean>>({});
+  const voltageTripStateRef = useRef<Record<string, string>>({});
+  const timerActiveRef = useRef<Record<string, boolean>>({});
 
   const activeSocket = sockets.find((s) => s.id.toUpperCase() === selectedSocketId?.toUpperCase()) || null;
 
@@ -122,13 +131,55 @@ export default function App() {
           const deviceId = (rawId || 'SOCKET-01').toUpperCase();
           const now = Date.now();
           const highTemp = payload.highTemperatureAlarm === true;
+          const isOutage = payload.gridStatus === 'NO_LIGHT' || payload.isOnline === false;
 
           if (highTemp && !temperatureAlarmStateRef.current[deviceId]) {
             sendAppNotification('PowerSense High Temp Warning ⚠️', `${deviceId} temperature is above 50°C!`);
           }
           temperatureAlarmStateRef.current[deviceId] = highTemp;
 
-          const isOutage = payload.gridStatus === 'NO_LIGHT' || payload.isOnline === false;
+          // ── Outage / Restore notifications ─────────────────────────────────
+          const wasOutage = outageStateRef.current[deviceId] === true;
+          if (isOutage && !wasOutage) {
+            sendAppNotification(
+              'PowerSense ⚠️ Power Outage',
+              `No mains power detected on ${deviceId}. Grid voltage is 0V.`,
+              NOTIF_IDS.OUTAGE(deviceId)
+            );
+          } else if (!isOutage && wasOutage) {
+            sendAppNotification(
+              'PowerSense ✅ Power Restored',
+              `Mains supply is back on ${deviceId}. Socket is recovering.`,
+              NOTIF_IDS.RESTORED(deviceId)
+            );
+          }
+          outageStateRef.current[deviceId] = isOutage;
+
+          // ── Voltage Guard trip notification ────────────────────────────────
+          const prevTrip = voltageTripStateRef.current[deviceId] || 'NORMAL';
+          const newTrip = payload.voltageGuard || 'NORMAL';
+          if (newTrip !== 'NORMAL' && prevTrip === 'NORMAL') {
+            const tripMsg =
+              newTrip === 'SURGE'
+                ? `🚨 SURGE: Voltage exceeded 250V on ${deviceId}! Appliance protected.`
+                : newTrip === 'BROWNOUT'
+                ? `⚠️ BROWNOUT: Dangerous low voltage on ${deviceId}! Power cut to protect appliance.`
+                : `⏳ ${deviceId} Voltage Guard tripped — recovering…`;
+            sendAppNotification('PowerSense Voltage Guard 🛡️', tripMsg, NOTIF_IDS.VOLTAGE_TRIP(deviceId));
+          }
+          voltageTripStateRef.current[deviceId] = newTrip;
+
+          // ── Timer finished notification ────────────────────────────────────
+          const wasTimerOn = timerActiveRef.current[deviceId] === true;
+          const isTimerOn = Boolean(payload.timerActive) && (payload.timerRemaining || 0) > 0;
+          if (wasTimerOn && !isTimerOn) {
+            sendAppNotification(
+              'PowerSense ⏱️ Timer Done',
+              `Auto-off timer expired — ${deviceId} has been switched off.`,
+              NOTIF_IDS.TIMER_DONE(deviceId)
+            );
+          }
+          timerActiveRef.current[deviceId] = isTimerOn;
 
           // Discovered devices pool
           setDiscoveredDevices((prev) => {
@@ -685,140 +736,159 @@ export default function App() {
           </div>
 
           {/* ==================================================== */}
-          {/* SIMPLIFIED SOCKET SETTINGS                           */}
+          {/* SOCKET SETTINGS — ACCORDION                          */}
           {/* ==================================================== */}
           <div className="settings-sheet">
-            <div className="sheet-header">⚙️ Socket Settings & Protection</div>
-
-            {/* 1. Appliance Voltage Guard */}
-            <div className="setting-item">
-              <div className="setting-row-top">
-                <span className="setting-title">🛡️ Appliance Voltage Guard</span>
-                <label className="switch">
-                  <input
-                    type="checkbox"
-                    checked={activeSocket.voltageGuardEnabled !== false}
-                    onChange={(e) =>
-                      updateSettings(activeSocket.id, { voltageGuardEnabled: e.target.checked })
-                    }
-                  />
-                  <span className="slider"></span>
-                </label>
-              </div>
-              <p className="setting-desc">
-                Automatically cuts power during severe surges (≥250V) or low voltage brownouts (≤175V)
-                to protect your refrigerator, TV, or inverter from burning.
-              </p>
-              {activeSocket.voltageGuard && activeSocket.voltageGuard !== 'NORMAL' && (
-                <div
-                  style={{
-                    backgroundColor: 'rgba(239, 68, 68, 0.15)',
-                    border: '1px solid #EF4444',
-                    padding: '8px 12px',
-                    borderRadius: 8,
-                    fontSize: 12,
-                    color: '#F87171',
-                    fontWeight: 600,
-                  }}
-                >
-                  {activeSocket.voltageGuard === 'SURGE'
-                    ? '🚨 SURGE TRIP: Voltage exceeded 250V! Power cut for appliance safety.'
-                    : activeSocket.voltageGuard === 'BROWNOUT'
-                    ? '⚠️ BROWNOUT TRIP: Dangerous low voltage (<175V) detected.'
-                    : `⏳ RECOVERING: Line normalized. Stabilizing for ${activeSocket.recoveryCountdown || 0}s...`}
-                </div>
-              )}
+            {/* Accordion Header */}
+            <div
+              className="accordion-header"
+              onClick={() => setSettingsOpen((o) => !o)}
+              role="button"
+              aria-expanded={settingsOpen}
+            >
+              <span className="sheet-header" style={{ margin: 0 }}>⚙️ Socket Settings &amp; Protection</span>
+              <span className={`accordion-chevron ${settingsOpen ? 'accordion-chevron-open' : ''}`}>▼</span>
             </div>
 
-            {/* 2. Safe Startup Delay */}
-            <div className="setting-item">
-              <span className="setting-title">⏱️ Safe Startup Delay</span>
-              <p className="setting-desc">
-                Delay power after power-up or grid return to avoid high inrush currents:
-              </p>
-              <div className="preset-pills-row">
-                <button
-                  onClick={() => updateSettings(activeSocket.id, { startupDelaySeconds: 0 })}
-                  className={`pill-choice ${
-                    activeSocket.startupDelaySeconds === 0 ? 'pill-choice-active' : ''
-                  }`}
-                >
-                  Instant (0s)
-                </button>
-                <button
-                  onClick={() => updateSettings(activeSocket.id, { startupDelaySeconds: 10 })}
-                  className={`pill-choice ${
-                    activeSocket.startupDelaySeconds === 10 || !activeSocket.startupDelaySeconds
-                      ? 'pill-choice-active'
-                      : ''
-                  }`}
-                >
-                  Standard (10s)
-                </button>
-                <button
-                  onClick={() => updateSettings(activeSocket.id, { startupDelaySeconds: 180 })}
-                  className={`pill-choice ${
-                    activeSocket.startupDelaySeconds === 180 ? 'pill-choice-active' : ''
-                  }`}
-                >
-                  Fridge Safe (3 min)
-                </button>
-              </div>
-            </div>
+            {/* Accordion Body */}
+            {settingsOpen && (
+              <div className="accordion-body">
 
-            {/* 3. Auto-Off Timer */}
-            <div className="setting-item">
-              <span className="setting-title">⏳ Auto-Off Timer</span>
-              <p className="setting-desc">
-                Automatically switch off the socket after a set time (great for water pumping machines & chargers):
-              </p>
-
-              {activeSocket.timerActive && (activeSocket.timerRemaining || 0) > 0 ? (
-                <div className="active-timer-box">
-                  <div>
-                    <div style={{ fontSize: 11, color: '#38BDF8', fontWeight: 700 }}>
-                      TURNING OFF IN:
-                    </div>
-                    <div className="timer-clock">
-                      {formatTimerDuration(activeSocket.timerRemaining)}
-                    </div>
+                {/* 1. Appliance Voltage Guard */}
+                <div className="setting-item">
+                  <div className="setting-row-top">
+                    <span className="setting-title">🛡️ Appliance Voltage Guard</span>
+                    <label className="switch">
+                      <input
+                        type="checkbox"
+                        checked={activeSocket.voltageGuardEnabled !== false}
+                        onChange={(e) =>
+                          updateSettings(activeSocket.id, { voltageGuardEnabled: e.target.checked })
+                        }
+                      />
+                      <span className="slider"></span>
+                    </label>
                   </div>
-                  <button
-                    onClick={() => cancelTimer(activeSocket.id)}
-                    className="btn-cancel-timer"
-                  >
-                    Cancel Timer
-                  </button>
+                  <p className="setting-desc">
+                    Automatically cuts power during severe surges (≥250V) or low voltage brownouts (≤175V)
+                    to protect your refrigerator, TV, or inverter from burning.
+                  </p>
+                  {activeSocket.voltageGuard && activeSocket.voltageGuard !== 'NORMAL' && (
+                    <div
+                      style={{
+                        backgroundColor: 'rgba(239, 68, 68, 0.15)',
+                        border: '1px solid #EF4444',
+                        padding: '8px 12px',
+                        borderRadius: 8,
+                        fontSize: 12,
+                        color: '#F87171',
+                        fontWeight: 600,
+                      }}
+                    >
+                      {activeSocket.voltageGuard === 'SURGE'
+                        ? '🚨 SURGE TRIP: Voltage exceeded 250V! Power cut for appliance safety.'
+                        : activeSocket.voltageGuard === 'BROWNOUT'
+                        ? '⚠️ BROWNOUT TRIP: Dangerous low voltage (<175V) detected.'
+                        : `⏳ RECOVERING: Line normalized. Stabilizing for ${activeSocket.recoveryCountdown || 0}s...`}
+                    </div>
+                  )}
                 </div>
-              ) : (
-                <div className="preset-pills-row">
-                  <button
-                    onClick={() => setQuickTimer(activeSocket.id, 15)}
-                    className="pill-choice"
-                  >
-                    ⚡ 15 min
-                  </button>
-                  <button
-                    onClick={() => setQuickTimer(activeSocket.id, 30)}
-                    className="pill-choice"
-                  >
-                    🚰 30 min (Pump)
-                  </button>
-                  <button
-                    onClick={() => setQuickTimer(activeSocket.id, 60)}
-                    className="pill-choice"
-                  >
-                    🔋 1 Hour
-                  </button>
-                  <button
-                    onClick={() => setQuickTimer(activeSocket.id, 120)}
-                    className="pill-choice"
-                  >
-                    ⚡ 2 Hours
-                  </button>
+
+                {/* 2. Safe Startup Delay */}
+                <div className="setting-item">
+                  <span className="setting-title">⏱️ Safe Startup Delay</span>
+                  <p className="setting-desc">
+                    Current delay: <strong style={{ color: '#38BDF8' }}>{activeSocket.startupDelaySeconds ?? 10}s</strong>
+                    &nbsp;— Set how long to wait before power restores after grid returns:
+                  </p>
+                  <div className="input-apply-row">
+                    <input
+                      type="number"
+                      min="0"
+                      max="3600"
+                      className="input-field input-field-inline"
+                      placeholder="Delay in seconds (e.g. 10)"
+                      value={delayInput}
+                      onChange={(e) => setDelayInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && delayInput !== '') {
+                          updateSettings(activeSocket.id, { startupDelaySeconds: Math.max(0, Math.min(3600, Number(delayInput))) });
+                          setDelayInput('');
+                        }
+                      }}
+                    />
+                    <button
+                      className="btn-apply"
+                      disabled={delayInput === ''}
+                      onClick={() => {
+                        if (delayInput === '') return;
+                        updateSettings(activeSocket.id, { startupDelaySeconds: Math.max(0, Math.min(3600, Number(delayInput))) });
+                        setDelayInput('');
+                      }}
+                    >
+                      Apply
+                    </button>
+                  </div>
                 </div>
-              )}
-            </div>
+
+                {/* 3. Auto-Off Timer */}
+                <div className="setting-item">
+                  <span className="setting-title">⏳ Auto-Off Timer</span>
+                  <p className="setting-desc">
+                    Automatically switch off the socket after a set time (great for water pumps &amp; chargers):
+                  </p>
+
+                  {activeSocket.timerActive && (activeSocket.timerRemaining || 0) > 0 ? (
+                    <div className="active-timer-box">
+                      <div>
+                        <div style={{ fontSize: 11, color: '#38BDF8', fontWeight: 700 }}>
+                          TURNING OFF IN:
+                        </div>
+                        <div className="timer-clock">
+                          {formatTimerDuration(activeSocket.timerRemaining)}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => cancelTimer(activeSocket.id)}
+                        className="btn-cancel-timer"
+                      >
+                        Cancel Timer
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="input-apply-row">
+                      <input
+                        type="number"
+                        min="1"
+                        max="1440"
+                        className="input-field input-field-inline"
+                        placeholder="Minutes (e.g. 30)"
+                        value={timerInput}
+                        onChange={(e) => setTimerInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && timerInput !== '') {
+                            setQuickTimer(activeSocket.id, Math.max(1, Math.min(1440, Number(timerInput))));
+                            setTimerInput('');
+                          }
+                        }}
+                      />
+                      <button
+                        className="btn-apply"
+                        disabled={timerInput === ''}
+                        onClick={() => {
+                          if (timerInput === '') return;
+                          setQuickTimer(activeSocket.id, Math.max(1, Math.min(1440, Number(timerInput))));
+                          setTimerInput('');
+                        }}
+                      >
+                        Start Timer
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+              </div>
+            )}
           </div>
         </main>
       )}
